@@ -44,7 +44,7 @@ CMD ["node", "src/manager.mjs"]
 
 # Optional offline unit-test target: docker build --target test .
 FROM runtime AS test
-COPY Dockerfile .dockerignore .gitignore package-lock.json ./
+COPY Dockerfile .dockerignore .gitignore package-lock.json requirements.txt ./
 COPY tests/ ./tests/
 RUN node --test tests/*.test.mjs \
     && .venv/bin/python -m unittest discover -s tests
