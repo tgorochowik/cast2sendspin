@@ -17,16 +17,16 @@ including Premium-quality audio. No shared Google login or browser cookies.
 
 ## Quickstart
 
-Use a Linux Docker host on the same LAN as your phone, with Music Assistant
-and its Sendspin Source provider available.
-The **[`compose.yaml`](compose.yaml)** in this repository pulls your GHCR image.
-Set its image address in `.env`, using **[`.env.example`](.env.example)** as a template.
+Run locally to get started or try it out—**Docker is optional**. Once dependencies
+and configuration are set up, **`npm start` is all you need to launch the app**.
+
+You'll need Node.js 22+, Python 3.14+, and FFmpeg, on the same LAN as your phone,
+with Music Assistant and its Sendspin Source provider available.
 
 1. Clone this repository, then prepare your configuration:
 
    ```sh
    cp config.example.json config.json
-   cp .env.example .env
    mkdir -p .state
    chmod 700 .state
    touch .ma_token
@@ -38,13 +38,14 @@ Set its image address in `.env`, using **[`.env.example`](.env.example)** as a t
      (`ip -brief address` lists interfaces).
    - **`.ma_token`**: paste an MA access token with player-control and
      provider/player-configuration permissions.
-   - **`.env`**: set `IMAGE=ghcr.io/YOUR_GITHUB_USER/cast2sendspin:latest`
-     using your lowercase GitHub name. Match `PUID`/`PGID` to the files' owner.
 
-3. Start:
+3. Install dependencies once, then start:
 
    ```sh
-   docker compose up -d
+    npm ci --ignore-scripts
+    python3 -m venv .venv
+    .venv/bin/pip install -r requirements.txt
+    npm start
    ```
 
 4. Open **http://localhost:8790**, name a receiver, and enable it.
@@ -54,7 +55,24 @@ Set its image address in `.env`, using **[`.env.example`](.env.example)** as a t
 For manual routing, select **Single source** in the UI, then play its input from
 **Browse → Sendspin Source** on your chosen MA player or group.
 
-## Updates
+## Docker (optional)
+
+For a Linux homelab server, **[`compose.yaml`](compose.yaml)** pulls a prebuilt
+GHCR image instead. Use the same `config.json` and `.ma_token` from above; no
+local Node.js, Python, or FFmpeg installation is needed.
+
+Copy **[`.env.example`](.env.example)** to `.env`, set
+`IMAGE=ghcr.io/YOUR_GITHUB_USER/cast2sendspin:latest` using your lowercase GitHub
+name, and match `PUID`/`PGID` to the files' owner. Stop any locally running
+instance before starting Docker.
+
+```sh
+cp .env.example .env
+# Edit .env, then:
+docker compose up -d
+```
+
+### Updates
 
 ```sh
 docker compose pull
@@ -80,15 +98,11 @@ IMAGE=cast2sendspin:local docker compose up -d
 
 ## Development
 
-Node.js 22+, Python 3.14+, and FFmpeg:
+After the local setup above, run the tests with:
 
 ```sh
-npm ci --ignore-scripts
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
 npm test
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
-npm start
 ```
 
 ### Repository layout
