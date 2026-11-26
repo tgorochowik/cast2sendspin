@@ -1,0 +1,27 @@
+# Private local configuration and runtime state
+config.json
+.ma_token
+.env
+.env.*
+!.env.example
+.state/
+*.log
+*.log.*
+*.jsonl
+*.pem
+*.key
+
+# Separate, unpublished plugin
+/ma_youtube_cast/
+
+# Local dependencies, caches and generated files
+node_modules/
+.npm-cache/
+.pip-cache/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+dist/
+coverage/

@@ -1,0 +1,41 @@
+services:
+  cast2sendspin:
+    image: "${IMAGE:?Set IMAGE in .env to your GHCR image}"
+    # Linux host networking preserves SSDP multicast and advertised LAN URLs.
+    # Do not add ports: mappings when using host networking.
+    network_mode: host
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 75s
+    user: "${PUID:-1000}:${PGID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: ./config.json
+        target: /app/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.ma_token
+        target: /run/secrets/ma_token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.state
+        target: /app/.state
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

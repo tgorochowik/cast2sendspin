@@ -1,0 +1,8 @@
+{
+  "ma_url": "http://192.168.1.10:8095",
+  "sendspin_url": "ws://192.168.1.10:8927/sendspin",
+  "dial_interface": "eth0",
+  "management_host": "127.0.0.1",
+  "management_port": 8790,
+  "allow_anonymous_fallback": false
+}

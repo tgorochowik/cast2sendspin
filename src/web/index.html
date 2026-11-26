@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cast2Sendspin</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="app-bar">
+    <div class="app-bar-inner">
+      <span class="brand-icon" aria-hidden="true">
+        <img src="/icon.svg" width="36" height="36" alt="">
+      </span>
+      <span>Cast2Sendspin</span>
+      <span class="local-badge">LOCAL</span>
+    </div>
+  </header>
+  <main>
+    <div class="page-heading">
+      <div><h1>Cast receivers</h1><p>Play from YouTube Music on your Music Assistant speakers.</p></div>
+      <button id="refresh" class="button secondary" disabled>Refresh</button>
+    </div>
+    <section class="mode-section" aria-labelledby="mode-title">
+      <div><h2 id="mode-title">Routing mode</h2><p id="mode-description">Loading configuration…</p></div>
+      <div class="segmented" role="group" aria-label="Routing mode">
+        <button type="button" data-mode="automatic" aria-pressed="false" disabled>Per-speaker receivers</button>
+        <button type="button" data-mode="manual" aria-pressed="false" disabled>Single source</button>
+      </div>
+    </section>
+    <p id="error" class="error" role="alert" hidden></p>
+    <p id="status" class="status-line" role="status">Connecting…</p>
+
+    <section id="automatic-section" aria-labelledby="speakers-title">
+      <div class="section-heading"><h2 id="speakers-title">Speakers</h2><span id="speaker-count"></span></div>
+      <div class="list-heading" aria-hidden="true">
+        <span>Music Assistant player</span><span>Receiver name</span><span>Status</span><span>Expose</span><span></span>
+      </div>
+      <ul id="players" class="player-list" aria-label="Discovered speakers"></ul>
+      <p id="empty" class="empty" hidden>No speakers discovered yet. Check the MA connection and refresh.</p>
+      <p class="hint">New speakers stay private until enabled. Cast-backed outputs and groups are excluded and shown last.</p>
+    </section>
+
+    <section id="manual-section" aria-labelledby="manual-title" hidden>
+      <div class="section-heading"><h2 id="manual-title">One receiver. You choose the speakers.</h2><span id="manual-status" class="badge"></span></div>
+      <div class="manual-content">
+        <p>Advertise a single YouTube Music receiver and expose its audio as one Sendspin input.
+          Speaker discovery and automatic routing are disabled in this mode.</p>
+        <form id="manual-form">
+          <label class="field">Receiver name<input name="name" maxlength="80" required autocomplete="off"></label>
+          <label class="switch-label"><input class="switch" type="checkbox" name="enabled"> Enable receiver</label>
+          <button class="button" type="submit">Save</button>
+        </form>
+        <ol class="steps">
+          <li>In MA, select your player or group.</li>
+          <li>Open <strong>Browse → Sendspin Source</strong> and play <strong id="source-name">the cast input</strong>.</li>
+          <li>Cast from YouTube Music. You can also cast first, then select the input in MA.</li>
+        </ol>
+        <p class="hint">Playback waits until MA requests the input. Volume in YouTube Music adjusts the input audio.
+          MA controls speaker volume, routing, and power. Stop Casting leaves your manual routing selected with silence.</p>
+      </div>
+    </section>
+    <footer>Local-only management · Switching modes, renaming, or disabling a receiver ends its casting session.
+      Your per-speaker settings and receiver identities are preserved.</footer>
+  </main>
+  <template id="player-template">
+    <li class="player-row">
+      <form class="row-grid">
+        <div class="player-cell">
+          <span class="device-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="15" r="4"/><circle cx="12" cy="6" r="1"/></svg>
+          </span>
+          <div class="player-text"><h3></h3><p class="details"></p><p class="reason"></p></div>
+        </div>
+        <label class="field name-field"><span class="sr-only">Receiver name</span><input name="name" maxlength="80" required autocomplete="off"></label>
+        <div class="status-cell"><span class="badge"></span><span class="port"></span></div>
+        <label class="switch-label expose-label"><span class="sr-only">Expose receiver</span><input class="switch" type="checkbox" name="enabled"></label>
+        <button class="button secondary save-button" type="submit">Save</button>
+      </form>
+    </li>
+  </template>
+</body>
+</html>

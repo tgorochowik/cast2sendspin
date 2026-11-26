@@ -1,0 +1,22 @@
+# Only release source enters the build context. Never send local state/secrets.
+**
+!Dockerfile
+!.dockerignore
+!.gitignore
+!package.json
+!package-lock.json
+!requirements.txt
+!LICENSE
+!NOTICE
+!THIRD_PARTY_NOTICES.md
+!src/
+!src/*.mjs
+!src/*.py
+!src/web/
+!src/web/*.html
+!src/web/*.js
+!src/web/*.css
+!src/web/*.svg
+!tests/
+!tests/*.test.mjs
+!tests/test_*.py
