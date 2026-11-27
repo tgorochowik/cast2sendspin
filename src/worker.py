@@ -389,22 +389,23 @@ class Worker:
             emit("AUDIO_RESOLVED", video_id=video_id, resolver=info.get("resolver"),
                  itag=info.get("itag"), bitrate=info.get("bitrate"))
             self.duration = float(info.get("duration") or 0)
-            self.paused = False
-            if not self.router.active:
-                await self.router.claim()
-            if self.manual:
-                # Accept selections before MA has selected this input. Decode
-                # only when MA requests the source; do not consume a whole song
-                # invisibly while the user is still choosing speakers.
-                self.position = position
-                self.decoder_pending = True
-                emit("TRACK_READY", video_id=video_id, title=info.get("title"))
-                return self.state()
+            self.paused = True
             try:
+                if not self.router.active:
+                    await self.router.claim()
+                if self.manual:
+                    # Decode only after MA selects this input, not while the
+                    # user is still choosing where to play it.
+                    self.position = position
+                    self.decoder_pending = True
+                    self.paused = False
+                    emit("TRACK_READY", video_id=video_id, title=info.get("title"))
+                    return self.state()
                 if self.router.suspended:
                     await self.router.resume()
                 await asyncio.wait_for(self.streaming.wait(), 20)
                 await self.decoder_at(position)
+                self.paused = False
                 # Observe a little actual PCM before telling the phone that it
                 # is playing, rather than claiming success for a failing decoder.
                 initial_position = self.position

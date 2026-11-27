@@ -30,6 +30,33 @@ test('explicit stop releases the casting session', async () => {
   assert.deepEqual(calls, ['finish']);
 });
 
+test('setPlaylist stop before play keeps the MA input selected', async () => {
+  const { player, calls } = fixture();
+  await player.play({ id: 'Kf5pXDhx5Vc' }, 0);
+  calls.length = 0;
+  player.queue.setAsCurrent({ id: 'enPg09IpUjU' });
+  await player.stop();
+  assert.deepEqual(calls, ['track_stop']);
+  await player.play({ id: 'enPg09IpUjU' }, 0);
+  calls.length = 0;
+  await player.stop();
+  assert.deepEqual(calls, ['finish']);
+});
+
+test('a repeated video at a new queue index is still a track replacement', async () => {
+  const { player, calls } = fixture();
+  await player.play({ id: 'Kf5pXDhx5Vc', context: { index: 0 } }, 0);
+  calls.length = 0;
+  player.queue.setAsCurrent({ id: 'Kf5pXDhx5Vc', context: { index: 1 } });
+  // Playlist.setAsCurrent deliberately ignores identical IDs; use its public
+  // snapshot only in a stub here to exercise repeated-video queue selections.
+  Object.defineProperty(player.queue, 'current', {
+    get: () => ({ id: 'Kf5pXDhx5Vc', context: { index: 1 } })
+  });
+  await player.stop();
+  assert.deepEqual(calls, ['track_stop']);
+});
+
 test('reset while idle still cancels pending worker loads', async () => {
   const { player, calls } = fixture();
   await player.reset();
