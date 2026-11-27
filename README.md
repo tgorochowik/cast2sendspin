@@ -55,6 +55,12 @@ with Music Assistant and its Sendspin Source provider available.
 For manual routing, select **Single source** in the UI, then play its input from
 **Browse → Sendspin Source** on your chosen MA player or group.
 
+In per-speaker mode, pause stops MA's output while keeping the YouTube session;
+MA may show the speaker as idle. Resume restarts the input at the remembered
+position, and seek interrupts the output before restarting at the new position.
+Restarting can still take time to buffer. Single-source/manual mode leaves MA's
+output controls alone.
+
 ## Docker (optional)
 
 For a Linux homelab server, **[`compose.yaml`](compose.yaml)** pulls a prebuilt

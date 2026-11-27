@@ -47,6 +47,11 @@ class Worker extends EventEmitter {
         if (!pending) return;
         this.pending.delete(message.id);
         clearTimeout(pending.timer);
+        log('COMMAND_COMPLETED', {
+          request_id: message.id, method: pending.method,
+          duration_ms: Math.round(performance.now() - pending.started),
+          success: !message.error
+        });
         if (message.error) {
           log('COMMAND_FAILED', { method: pending.method, errorType: message.error });
           pending.reject(new Error('Media command failed'));
@@ -57,7 +62,9 @@ class Worker extends EventEmitter {
       } else {
         log(message.event, Object.fromEntries(
           Object.entries(message).filter(([key]) =>
-            ['video_id', 'title', 'reason', 'error_type', 'resolver', 'itag', 'bitrate'].includes(key))
+            ['video_id', 'title', 'reason', 'error_type', 'resolver', 'itag', 'bitrate',
+              'request_id', 'method', 'duration_ms', 'generation', 'kind', 'position',
+              'read_ms', 'feed_ms', 'forced_kill'].includes(key))
         ));
         if (message.event === 'READY') {
           this.state = message.state;
@@ -71,12 +78,15 @@ class Worker extends EventEmitter {
   }
   call(method, args = {}) {
     const id = ++this.sequence;
+    const started = performance.now();
+    log('COMMAND_STARTED', { request_id: id, method });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        log('COMMAND_TIMEOUT', { request_id: id, method, duration_ms: Math.round(performance.now() - started) });
         reject(new Error('Media command timed out'));
       }, 90000);
-      this.pending.set(id, { resolve, reject, timer, method });
+      this.pending.set(id, { resolve, reject, timer, method, started });
       this.process.stdin.write(`${JSON.stringify({ id, method, args })}\n`);
     });
   }

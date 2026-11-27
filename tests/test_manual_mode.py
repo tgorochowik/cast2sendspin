@@ -62,6 +62,19 @@ class ManualModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.volume["level"], 50)
         worker.ma.call.assert_not_awaited()
 
+    async def test_pause_resume_and_seek_never_control_manual_outputs(self):
+        worker = self.worker()
+        await worker.router.claim()
+        worker.duration = 100
+        worker.info = {"url": "https://example.test/audio"}
+        await worker.command("pause", {})
+        await worker.command("seek", {"position": 30})
+        self.assertTrue(worker.paused)
+        await worker.command("resume", {})
+        self.assertFalse(worker.paused)
+        worker.ma.call.assert_not_awaited()
+        worker.ma.player.assert_not_awaited()
+
     async def test_ma_source_release_does_not_end_youtube_session(self):
         worker = self.worker()
         await worker.router.claim()
@@ -80,8 +93,11 @@ class ManualModeTests(unittest.IsolatedAsyncioTestCase):
         worker.client = Mock(create_source_capture=Mock(return_value=capture))
 
         async def decode(position):
-            stdout = Mock(readexactly=AsyncMock(return_value=bytes(FRAME_BYTES)))
-            worker.decoder = Mock(stdout=stdout, returncode=0)
+            stdout = Mock(
+                readexactly=AsyncMock(return_value=bytes(FRAME_BYTES)),
+                read=AsyncMock(return_value=b""),
+            )
+            worker.decoder = Mock(stdout=stdout, returncode=0, wait=AsyncMock())
             worker.position = position
 
         worker.decoder_at = AsyncMock(side_effect=decode)

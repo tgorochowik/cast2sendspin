@@ -111,6 +111,7 @@ class Worker:
         self.client = None
         self.router = None
         self.capture_task = None
+        self.source_epoch = 0
         self.decoder = None
         self.info = None
         self.video_id = None
@@ -121,6 +122,7 @@ class Worker:
         self.generation = 0
         self.streaming = asyncio.Event()
         self.lock = asyncio.Lock()
+        self.decoder_read_lock = asyncio.Lock()
         self.shutting_down = False
         self.monitor_task = None
         self.capture_failure = None
@@ -160,17 +162,36 @@ class Worker:
     def source_command(self, payload):
         if payload.source is None:
             return
+        self.source_epoch += 1
         if payload.source.command == "start":
-            self.capture_task = asyncio.create_task(self.stream())
+            previous = self.capture_task
+            self.capture_task = asyncio.create_task(self.start_stream(previous))
         elif payload.source.command == "stop":
             self.streaming.clear()
             if self.capture_task:
                 self.capture_task.cancel()
-                self.capture_task = None
             if self.router and self.router.active and not self.router.closing:
-                asyncio.create_task(self.source_released())
+                asyncio.create_task(self.source_released(self.source_epoch))
 
-    async def source_released(self):
+    async def start_stream(self, previous):
+        # An old capture's finalizer must not end a newly opened source stream.
+        if previous:
+            previous.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await previous
+        await self.stream()
+
+    async def stop_capture(self):
+        task = self.capture_task
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            if self.capture_task is task:
+                self.capture_task = None
+        self.streaming.clear()
+
+    async def source_released(self, epoch=None):
         if self.manual:
             async with self.lock:
                 if not self.streaming.is_set():
@@ -182,11 +203,42 @@ class Worker:
         # power-off here: the receiver could already be playing something else.
         await asyncio.sleep(0.5)
         async with self.lock:
+            # Stop/start may already have replaced this capture by the time the
+            # delayed callback runs. It must not cancel the resumed session.
+            if epoch is not None and epoch != self.source_epoch:
+                return
             if self.router.active and not self.router.closing:
+                p = await self.ma.player(self.router.target)
+                if owns_source(p, self.router.uri) and p.get("available") and (
+                    self.router.suspended or self.streaming.is_set()
+                ):
+                    return
                 self.router.yield_to_external()
                 self.invalidate()
                 await self.stop_decoder()
                 emit("TAKEN_OVER")
+
+    async def suspend_output(self):
+        # Pause consumption immediately, then flush MA's queued output via Stop.
+        # Keep metadata, position, source selection and power ownership intact.
+        self.paused = True
+        self.invalidate()
+        self.decoder_pending = False
+        await self.router.suspend()
+        await self.stop_capture()
+        await self.stop_decoder()
+
+    async def resume_output(self):
+        try:
+            await self.router.resume()
+            await asyncio.wait_for(self.streaming.wait(), 20)
+            await self.decoder_at(self.position)
+            self.paused = False
+        except BaseException:
+            self.paused = True
+            await self.stop_decoder()
+            await self.router.finish()
+            raise
 
     async def stream(self):
         self.capture_failure = None
@@ -198,11 +250,14 @@ class Worker:
             self.streaming.set()
             emit("SOURCE_STREAM_STARTED")
             next_deadline = asyncio.get_running_loop().time()
+            last_pcm_state = None
             while True:
                 next_deadline = max(
                     next_deadline + 0.025, asyncio.get_running_loop().time()
                 )
                 pcm = SILENCE
+                kind = "paused" if self.paused else "idle"
+                read_ms = 0
                 if self.manual and self.decoder_pending and not self.lock.locked():
                     async with self.lock:
                         if self.info and self.router.active and self.decoder_pending:
@@ -212,11 +267,17 @@ class Worker:
                 generation = self.generation
                 if decoder and not self.paused:
                     try:
+                        read_started = asyncio.get_running_loop().time()
                         async with asyncio.timeout(15):
-                            pcm = await decoder.stdout.readexactly(FRAME_BYTES)
+                            async with self.decoder_read_lock:
+                                if decoder is not self.decoder:
+                                    continue
+                                pcm = await decoder.stdout.readexactly(FRAME_BYTES)
+                        read_ms = round((asyncio.get_running_loop().time() - read_started) * 1000)
                         if generation != self.generation or decoder is not self.decoder:
                             continue
                         self.position += len(pcm) / 192000
+                        kind = "audio"
                     except asyncio.IncompleteReadError as e:
                         code = await decoder.wait()
                         if decoder is self.decoder:
@@ -226,7 +287,16 @@ class Worker:
                             else:
                                 emit("PLAYBACK_ERROR", reason="Decoder failed")
                         pcm = e.partial + bytes(FRAME_BYTES - len(e.partial))
+                feed_started = asyncio.get_running_loop().time()
                 await capture.feed(apply_input_volume(pcm, self.volume) if self.manual else pcm)
+                feed_ms = round((asyncio.get_running_loop().time() - feed_started) * 1000)
+                pcm_state = (generation, kind)
+                if pcm_state != last_pcm_state:
+                    emit("PCM_TRANSITION", generation=generation, kind=kind,
+                         position=round(self.position, 3), read_ms=read_ms, feed_ms=feed_ms)
+                    last_pcm_state = pcm_state
+                if read_ms >= 250 or feed_ms >= 250:
+                    emit("PCM_STALL", generation=generation, read_ms=read_ms, feed_ms=feed_ms)
                 await asyncio.sleep(max(0, next_deadline - asyncio.get_running_loop().time()))
         except asyncio.CancelledError:
             raise
@@ -241,17 +311,36 @@ class Worker:
 
     async def stop_decoder(self):
         proc, self.decoder = self.decoder, None
-        if proc and proc.returncode is None:
+        if not proc:
+            return
+        started = asyncio.get_running_loop().time()
+        forced_kill = False
+        if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), 3)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                await proc.wait()
+
+        async def drain_and_wait():
+            # FFmpeg may flush PCM on SIGTERM. Without a reader its full pipe
+            # blocks shutdown until the kill timeout, delaying the next track.
+            # Share the read lock with stream() to avoid concurrent pipe reads.
+            async with self.decoder_read_lock:
+                if proc.stdout:
+                    while await proc.stdout.read(65536):
+                        pass
+            await proc.wait()
+
+        try:
+            await asyncio.wait_for(drain_and_wait(), 3)
+        except TimeoutError:
+            forced_kill = True
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await drain_and_wait()
+        emit("DECODER_STOPPED", duration_ms=round(
+            (asyncio.get_running_loop().time() - started) * 1000), forced_kill=forced_kill)
 
     async def decoder_at(self, position):
+        started = asyncio.get_running_loop().time()
         await self.stop_decoder()
         if not self.info:
             raise RuntimeError("No track loaded")
@@ -267,6 +356,8 @@ class Worker:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
         self.position = position
+        emit("DECODER_STARTED", position=position, generation=self.generation,
+             duration_ms=round((asyncio.get_running_loop().time() - started) * 1000))
 
     async def play(self, video_id, position=0, context=None):
         if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
@@ -310,6 +401,8 @@ class Worker:
                 emit("TRACK_READY", video_id=video_id, title=info.get("title"))
                 return self.state()
             try:
+                if self.router.suspended:
+                    await self.router.resume()
                 await asyncio.wait_for(self.streaming.wait(), 20)
                 await self.decoder_at(position)
                 # Observe a little actual PCM before telling the phone that it
@@ -351,22 +444,35 @@ class Worker:
                 await self.stop_decoder()
                 self.decoder_pending = False
             elif method == "pause":
-                self.paused = True
+                if self.manual:
+                    self.paused = True
+                else:
+                    await self.suspend_output()
             elif method == "resume":
                 if not self.router.active:
                     raise RuntimeError("Cast no longer owns this destination")
-                self.paused = False
+                if not self.manual and self.router.suspended:
+                    await self.resume_output()
+                else:
+                    self.paused = False
             elif method == "seek":
                 position = float(args["position"])
                 if not math.isfinite(position) or position < 0 or position > self.duration:
                     raise RuntimeError("Invalid seek position")
                 if not self.router.active:
                     raise RuntimeError("Cast no longer owns this destination")
-                self.invalidate()
-                if self.manual and not self.streaming.is_set():
+                if not self.manual:
+                    was_paused = self.paused
+                    await self.suspend_output()
+                    self.position = position
+                    if not was_paused:
+                        await self.resume_output()
+                elif not self.streaming.is_set():
+                    self.invalidate()
                     self.position = position
                     self.decoder_pending = True
                 else:
+                    self.invalidate()
                     await self.decoder_at(position)
                     self.decoder_pending = False
             elif method == "volume":
@@ -447,6 +553,20 @@ class Worker:
             await self.ma.client.disconnect()
 
 
+async def handle_command(worker, request):
+    """Log command boundaries without arguments, credentials, or upstream errors."""
+    started = asyncio.get_running_loop().time()
+    details = {"request_id": request["id"], "method": request["method"]}
+    emit("COMMAND_RECEIVED", **details)
+    try:
+        result = await worker.command(request["method"], request.get("args", {}))
+        emit("COMMAND_APPLIED", **details, duration_ms=round(
+            (asyncio.get_running_loop().time() - started) * 1000))
+        emit("RESULT", id=request["id"], result=result)
+    except Exception as error:
+        emit("RESULT", id=request.get("id"), error=type(error).__name__)
+
+
 async def main():
     config = load_config()
     async with aiohttp.ClientSession() as session:
@@ -456,18 +576,11 @@ async def main():
         protocol = asyncio.StreamReaderProtocol(reader)
         await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, sys.stdin)
 
-        async def handle(request):
-            try:
-                result = await worker.command(request["method"], request.get("args", {}))
-                emit("RESULT", id=request["id"], result=result)
-            except Exception as error:
-                emit("RESULT", id=request.get("id"), error=type(error).__name__)
-
         try:
             await worker.start()
             while line := await reader.readline():
                 request = json.loads(line)
-                task = asyncio.create_task(handle(request))
+                task = asyncio.create_task(handle_command(worker, request))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
         finally:

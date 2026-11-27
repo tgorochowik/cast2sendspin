@@ -59,6 +59,7 @@ class SessionRouter:
     def __init__(self, ma, target, uri):
         self.ma, self.target, self.uri = ma, target, uri
         self.active = False
+        self.suspended = False
         self.closing = False
         self.power_owned = False
         self.lock = asyncio.Lock()
@@ -73,12 +74,43 @@ class SessionRouter:
             await self.ma.call("players/cmd/power", player_id=self.target, powered=True)
             self.power_owned = True
         self.active = True
+        self.suspended = False
         try:
             await self.ma.call("players/cmd/select_source", player_id=self.target, source=self.uri)
         except BaseException:
             # Only power down if no other playback has taken over.
             await self.finish(rollback=True)
             raise
+
+    async def require_ownership(self):
+        p = await self.ma.player(self.target)
+        if not self.active or not p.get("available") or not owns_source(p, self.uri):
+            self.yield_to_external()
+            raise RuntimeError("Cast no longer owns this destination")
+        return p
+
+    async def suspend(self):
+        """Interrupt the renderer without releasing the selected casting source."""
+        await self.require_ownership()
+        if self.suspended:
+            return
+        # Set before the RPC: its source-stop callback can precede the response.
+        self.suspended = True
+        await self.ma.call("players/cmd/stop", player_id=self.target)
+        async with asyncio.timeout(5):
+            while True:
+                p = await self.require_ownership()
+                if p.get("playback_state") == "idle":
+                    break
+                await asyncio.sleep(0.05)
+
+    async def resume(self):
+        """Restart only a source we still own; never reclaim after a takeover."""
+        await self.require_ownership()
+        if not self.suspended:
+            return
+        await self.ma.call("players/cmd/select_source", player_id=self.target, source=self.uri)
+        self.suspended = False
 
     async def finish(self, rollback=False):
         self.closing = True
@@ -116,11 +148,13 @@ class SessionRouter:
                 await self.ma.call("players/cmd/power", player_id=self.target, powered=False)
         finally:
             self.active = False
+            self.suspended = False
             self.power_owned = False
             self.closing = False
 
     def yield_to_external(self):
         self.active = False
+        self.suspended = False
         self.power_owned = False
 
 
