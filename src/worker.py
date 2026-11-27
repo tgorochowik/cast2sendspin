@@ -24,6 +24,7 @@ from ma import MA
 from app_config import load_config
 from routing import ManualSession, SessionRouter, owns_source, validate_target
 from source_client import connect_source
+from sender_resolver import SenderResolver
 
 FRAME_BYTES = 4800  # 25 ms, 48 kHz, stereo s16le
 SILENCE = bytes(FRAME_BYTES)
@@ -74,35 +75,6 @@ def resolve(video_id):
     return {k: result.get(k) for k in ("url", "duration", "title", "http_headers")}
 
 
-async def resolve_sender(video_id, context):
-    """Transfer sender credentials over private stdin, never argv or files."""
-    context = context if isinstance(context, dict) else {}
-    payload = json.dumps({"id": video_id, "context": {
-        key: context[key] for key in ("ctt", "params") if key in context
-    }}).encode()
-    if len(payload) > 49152:
-        raise RuntimeError("Sender authorization context too large")
-    proc = await asyncio.create_subprocess_exec(
-        "node", "src/youtube-resolver.mjs",
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL, limit=65536,
-    )
-    try:
-        async with asyncio.timeout(60):
-            output, _ = await proc.communicate(payload)
-        if proc.returncode or len(output) > 65536:
-            raise RuntimeError("Sender-authorized resolution failed")
-        info = json.loads(output).get("info")
-        if not isinstance(info, dict) or info.get("resolver") != "sender":
-            raise RuntimeError("Invalid sender resolver result")
-        return info
-    finally:
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
-
-
 class Worker:
     def __init__(self, ma, config):
         self.ma, self.config = ma, config
@@ -127,6 +99,8 @@ class Worker:
         self.monitor_task = None
         self.capture_failure = None
         self.resolution_task = None
+        self.resolver = SenderResolver(lambda **fields: emit("RESOLVER_TIMING", **fields))
+        self.resolver_warmup_task = None
 
     def invalidate(self):
         self.generation += 1
@@ -135,7 +109,7 @@ class Worker:
 
     async def resolve_media(self, video_id, context):
         try:
-            return await resolve_sender(video_id, context)
+            return await self.resolver.resolve(video_id, context)
         except Exception:
             if self.config.get("allow_anonymous_fallback") is not True:
                 emit("RESOLUTION_FAILED", reason="Sender authorization or audio resolution failed; anonymous fallback is disabled")
@@ -146,6 +120,7 @@ class Worker:
             return {**info, "resolver": "anonymous"}
 
     async def start(self):
+        self.resolver_warmup_task = asyncio.create_task(self.warmup_resolver())
         if self.manual:
             self.volume = {"level": 100, "muted": False}
         else:
@@ -158,6 +133,14 @@ class Worker:
             self.ma, self.config["target_player_id"], uri)
         self.monitor_task = asyncio.create_task(self.monitor())
         emit("READY", state=self.state())
+
+    async def warmup_resolver(self):
+        try:
+            await self.resolver.warmup()
+            emit("RESOLVER_WARMED")
+        except Exception:
+            # Playback can retry initialization later; no anonymous substitution.
+            emit("RESOLVER_WARMUP_FAILED")
 
     def source_command(self, payload):
         if payload.source is None:
@@ -545,6 +528,11 @@ class Worker:
         try:
             await self.command("finish", {})
         finally:
+            if self.resolver_warmup_task:
+                self.resolver_warmup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.resolver_warmup_task
+            await self.resolver.close()
             if self.capture_task:
                 self.capture_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

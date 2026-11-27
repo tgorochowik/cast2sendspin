@@ -64,7 +64,8 @@ class Worker extends EventEmitter {
           Object.entries(message).filter(([key]) =>
             ['video_id', 'title', 'reason', 'error_type', 'resolver', 'itag', 'bitrate',
               'request_id', 'method', 'duration_ms', 'generation', 'kind', 'position',
-              'read_ms', 'feed_ms', 'forced_kill'].includes(key))
+              'read_ms', 'feed_ms', 'forced_kill', 'init_ms', 'player_ms',
+              'decipher_ms', 'access_ms', 'total_ms', 'cache_hit'].includes(key))
         ));
         if (message.event === 'READY') {
           this.state = message.state;

@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { audioCandidates, credentialContext, resolveSender, validateMediaUrl } from '../src/youtube-resolver.mjs';
+import { Readable } from 'node:stream';
+import {
+  audioCandidates, credentialContext, createSenderResolver,
+  resolveSender, serve, validateMediaUrl
+} from '../src/youtube-resolver.mjs';
 import { sandboxEvaluate } from '../src/youtube-sandbox.mjs';
 
 test('missing sender token fails closed before making requests', async () => {
@@ -88,4 +92,137 @@ test('decipher sandbox exposes no process, network or filesystem APIs', async ()
   assert.deepEqual(await sandboxEvaluate({
     output: 'return {process: typeof process, fetch: typeof fetch, require: typeof require};'
   }), { process: 'undefined', fetch: 'undefined', require: 'undefined' });
+});
+
+function mockAudioAccess(t) {
+  t.mock.method(globalThis, 'fetch', async () => ({
+    ok: true, body: { getReader: () => ({
+      async read() { return { value: new Uint8Array(4096) }; },
+      async cancel() {}
+    }) }
+  }));
+}
+
+function fakeTube(onPlayer = () => {}) {
+  const tube = {
+    session: { context: {}, player: {
+      signature_timestamp: 123,
+      async decipher() { return 'https://r1.googlevideo.com/audio'; }
+    } },
+    actions: { async execute() {
+      await onPlayer(tube.session.context);
+      return { data: {
+        playabilityStatus: { status: 'OK' },
+        streamingData: { adaptiveFormats: [
+          { itag: 774, mimeType: 'audio/webm', url: 'https://r1.googlevideo.com/audio' }
+        ] }
+      } };
+    } }
+  };
+  return tube;
+}
+
+test('warmup and multiple songs reuse initialization but not sender credentials', async t => {
+  mockAudioAccess(t);
+  let created = 0;
+  const senders = [];
+  const tube = fakeTube(context => senders.push(context.user.credentialTransferTokens[0].token));
+  const resolver = createSenderResolver({ create: async () => { created++; return tube; } });
+  await resolver.warmup();
+  const first = await resolver.resolve({ id: 'ZFZM6jDTWd4', context: { ctt: 'sender-one' } });
+  const second = await resolver.resolve({ id: 'nwWVxPaOdN4', context: { ctt: 'sender-two' } });
+  assert.equal(created, 1);
+  assert.deepEqual(senders, ['sender-one', 'sender-two']);
+  assert.equal(tube.session.context.user, undefined);
+  assert.equal(first.timings.cache_hit, true);
+  assert.equal(second.timings.cache_hit, true);
+  assert.ok(Number.isInteger(second.timings.player_ms));
+  assert.ok(!JSON.stringify(second).includes('sender-'));
+});
+
+test('concurrent requests serialize credential-bearing player calls', async t => {
+  mockAudioAccess(t);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const seen = [];
+  const tube = fakeTube(async context => {
+    const token = context.user.credentialTransferTokens[0].token;
+    seen.push(token);
+    if (token === 'one') {
+      await gate;
+      assert.equal(context.user.credentialTransferTokens[0].token, 'one');
+    }
+  });
+  const resolver = createSenderResolver({ create: async () => tube });
+  const first = resolver.resolve({ id: 'ZFZM6jDTWd4', context: { ctt: 'one' } });
+  const second = resolver.resolve({ id: 'nwWVxPaOdN4', context: { ctt: 'two' } });
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(seen, ['one', 'two']);
+  assert.equal(tube.session.context.user, undefined);
+});
+
+test('failed requests clear credentials and reinitialize for the next request', async t => {
+  mockAudioAccess(t);
+  const failed = fakeTube(() => { throw new Error('upstream-token-secret'); });
+  const good = fakeTube();
+  const tubes = [failed, good];
+  let created = 0;
+  const resolver = createSenderResolver({ create: async () => tubes[created++] });
+  await assert.rejects(resolver.resolve({ id: 'ZFZM6jDTWd4', context: { ctt: 'one' } }));
+  assert.equal(failed.session.context.user, undefined);
+  await resolver.resolve({ id: 'nwWVxPaOdN4', context: { ctt: 'two' } });
+  assert.equal(created, 2);
+  assert.equal(good.session.context.user, undefined);
+});
+
+test('warm session expires and failed initialization can be retried', async () => {
+  let time = 0, created = 0;
+  const resolver = createSenderResolver({
+    now: () => time, maxAgeMs: 100,
+    create: async () => {
+      created++;
+      if (created === 1) throw new Error('initialization failed');
+      return fakeTube();
+    }
+  });
+  await assert.rejects(resolver.warmup());
+  await resolver.warmup();
+  await resolver.warmup();
+  assert.equal(created, 2);
+  time = 101;
+  await resolver.warmup();
+  assert.equal(created, 3);
+});
+
+test('persistent protocol handles multiple and malformed lines without leaking errors', async () => {
+  const writes = [], requests = [];
+  const resolver = {
+    async warmup() {},
+    async resolve(request) {
+      requests.push(request);
+      if (request.id === 'fail') throw new Error('synthetic-secret signed-url');
+      return { info: { resolver: 'sender' } };
+    }
+  };
+  await serve(Readable.from([
+    '{"op":"warmup","request_id":1}\ninvalid\nnull\n',
+    '{"op":"resolve","id":"fail","request_id":2,"context":{"ctt":"secret"}}\n',
+    '{"op":"resolve","id":"ok","request_id":3,"context":{"ctt":"another"}}\n'
+  ]), { write: line => writes.push(line) }, resolver);
+  const responses = writes.map(line => JSON.parse(line));
+  assert.equal(responses[0].ready, true);
+  assert.equal(responses[3].request_id, 2);
+  assert.equal(responses[3].error, 'SENDER_RESOLUTION_FAILED');
+  assert.equal(responses[4].request_id, 3);
+  assert.equal(responses[4].info.resolver, 'sender');
+  assert.ok(!writes.join('').includes('secret'));
+  assert.ok(requests.every(request => request.context.ctt === undefined));
+});
+
+test('persistent protocol bounds unterminated and oversized requests', async () => {
+  for (const input of ['x'.repeat(49153), 'x'.repeat(49153) + '\n']) {
+    await assert.rejects(serve(Readable.from([input]), { write() {} }), /REQUEST_TOO_LARGE/);
+  }
+  await assert.rejects(serve(Readable.from(['{"op":']), { write() {} }), /INCOMPLETE_REQUEST/);
 });

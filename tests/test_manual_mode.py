@@ -23,16 +23,18 @@ class ManualModeTests(unittest.IsolatedAsyncioTestCase):
         worker.ma.client.disconnect = AsyncMock()
         client = Mock(connected=True)
         client.disconnect = AsyncMock()
-        with patch("worker.connect_source", AsyncMock(return_value=(client, "source"))):
+        with patch("worker.connect_source", AsyncMock(return_value=(client, "source"))), patch.object(
+            worker.resolver, "warmup", AsyncMock()
+        ):
             await worker.start()
-        await worker.close()
+            await worker.close()
         worker.ma.player.assert_not_awaited()
         worker.ma.call.assert_not_awaited()
 
     async def test_play_accepts_track_before_input_is_selected_without_decoding(self):
         worker = self.worker()
         worker.decoder_at = AsyncMock()
-        with patch("worker.resolve_sender", AsyncMock(return_value={
+        with patch.object(worker.resolver, "resolve", AsyncMock(return_value={
             "url": "https://example.test/audio", "duration": 100, "resolver": "sender"
         })):
             result = await asyncio.wait_for(worker.play("Kf5pXDhx5Vc", 12), 1)
