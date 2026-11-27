@@ -61,6 +61,15 @@ position, and seek interrupts the output before restarting at the new position.
 Restarting can still take time to buffer. Single-source/manual mode leaves MA's
 output controls alone.
 
+Each enabled receiver keeps a YouTube resolver warm to reduce new-track startup
+time. Initialization is reused, but sender credentials are cleared after each
+request; every track still uses the current sender's authorization.
+
+Playback streams as audio arrives; the app does not download whole songs or
+speculatively buffer the next queue item. See the
+[latency investigation notes](docs/playback-latency-notes.md) for measurements and
+the results of the removed lookahead experiment.
+
 ## Docker (optional)
 
 For a Linux homelab server, **[`compose.yaml`](compose.yaml)** pulls a prebuilt
