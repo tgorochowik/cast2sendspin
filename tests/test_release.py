@@ -59,6 +59,19 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('href="/icon.svg"', (ROOT / "src/web/index.html").read_text())
         self.assertIn("['/icon.svg'", (ROOT / "src/manager.mjs").read_text())
 
+    def test_icon_uses_the_web_ui_theme_palette(self):
+        css = (ROOT / "src/web/style.css").read_text()
+        theme = re.search(r":root\s*\{([^}]+)\}", css, re.S).group(1)
+        palette = set(re.findall(r"#[0-9a-fA-F]{6}", theme))
+        primary = re.search(r"--primary:\s*(#[0-9a-fA-F]{6})", theme).group(1)
+        icon = ET.parse(ROOT / "src/web/icon.svg").getroot()
+        colors = {
+            value for element in icon.iter() for name, value in element.attrib.items()
+            if name in ("fill", "stroke") and value.startswith("#")
+        }
+        self.assertTrue(colors <= palette)
+        self.assertIn(primary, colors)
+
     def test_entry_points_and_subprocess_paths_exist(self):
         package = json.loads((ROOT / "package.json").read_text())
         self.assertTrue((ROOT / shlex.split(package["scripts"]["start"])[1]).is_file())
