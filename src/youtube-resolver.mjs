@@ -89,6 +89,10 @@ export async function resolveSender(
         return {
           url, title: data.videoDetails?.title,
           duration: Number(data.videoDetails?.lengthSeconds || 0),
+          ...(Number.isFinite(Number(format.approxDurationMs)) && Number(format.approxDurationMs) > 0
+            ? { audio_duration: Number(format.approxDurationMs) / 1000 } : {}),
+          ...(Number.isSafeInteger(Number(format.contentLength)) && Number(format.contentLength) > 0
+            ? { content_length: Number(format.contentLength) } : {}),
           resolver: 'sender', itag: format.itag,
           bitrate: format.averageBitrate || format.bitrate || 0
         };

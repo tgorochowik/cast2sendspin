@@ -7,6 +7,63 @@ from worker import FRAME_BYTES, Worker, handle_command
 
 
 class LatencyDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clean_exit_with_missing_audio_is_error_not_queue_advance(self):
+        worker = Worker(Mock(), {})
+        worker.position, worker.duration = 203.65, 216
+        worker.info = {"audio_duration": 215.741}
+        worker.decoder = Mock(
+            stdout=Mock(readexactly=AsyncMock(side_effect=asyncio.IncompleteReadError(b"", FRAME_BYTES))),
+            wait=AsyncMock(return_value=0),
+        )
+        fed = asyncio.Event()
+        capture = Mock(start=AsyncMock(), feed=AsyncMock(side_effect=lambda _: fed.set()),
+                       stop=AsyncMock())
+        worker.client = Mock(create_source_capture=Mock(return_value=capture))
+        with patch("worker.emit") as emit:
+            task = asyncio.create_task(worker.stream())
+            try:
+                await asyncio.wait_for(fed.wait(), 1)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        events = [call.args[0] for call in emit.call_args_list]
+        self.assertIn("PLAYBACK_ERROR", events)
+        self.assertNotIn("TRACK_ENDED", events)
+
+    async def test_decoder_eof_records_position_duration_and_exit_without_media_secrets(self):
+        for code in (0, 1):
+            with self.subTest(returncode=code):
+                worker = Worker(Mock(), {})
+                worker.position, worker.duration = 239, 240
+                worker.video_id = "ZFZM6jDTWd4"
+                worker.info = {"url": "https://example.test/signed-url-secret"}
+                worker.decoder = Mock(
+                    stdout=Mock(readexactly=AsyncMock(side_effect=asyncio.IncompleteReadError(b"x", FRAME_BYTES))),
+                    wait=AsyncMock(return_value=code),
+                )
+                fed = asyncio.Event()
+                capture = Mock(start=AsyncMock(), feed=AsyncMock(side_effect=lambda _: fed.set()),
+                               stop=AsyncMock())
+                worker.client = Mock(create_source_capture=Mock(return_value=capture))
+                with patch("worker.emit") as emit:
+                    task = asyncio.create_task(worker.stream())
+                    try:
+                        await asyncio.wait_for(fed.wait(), 1)
+                    finally:
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+                events = {call.args[0]: call.kwargs for call in emit.call_args_list}
+                eof = events["DECODER_EOF"]
+                self.assertEqual(eof["position"], 239)
+                self.assertEqual(eof["duration"], 240)
+                self.assertEqual(eof["returncode"], code)
+                self.assertEqual(eof["partial_bytes"], 1)
+                self.assertTrue(eof["current_decoder"])
+                self.assertIn("TRACK_ENDED" if code == 0 else "PLAYBACK_ERROR", events)
+                self.assertNotIn("signed-url-secret", repr(emit.call_args_list))
+
     async def test_command_timings_do_not_log_arguments(self):
         worker = Mock(command=AsyncMock(return_value={"paused": True}))
         with patch("worker.emit") as emit:

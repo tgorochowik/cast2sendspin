@@ -62,7 +62,8 @@ test('resolution uses sender authorization, checks access, and clears credential
         playabilityStatus: { status: 'OK' },
         videoDetails: { title: 'Title', lengthSeconds: '100' },
         streamingData: { adaptiveFormats: [
-          { itag: 141, mimeType: 'audio/mp4', audioQuality: 'AUDIO_QUALITY_HIGH', signatureCipher: 'cipher' }
+          { itag: 141, mimeType: 'audio/mp4', audioQuality: 'AUDIO_QUALITY_HIGH',
+            signatureCipher: 'cipher', approxDurationMs: '99950', contentLength: '1234567' }
         ] }
       } };
     } }
@@ -70,6 +71,8 @@ test('resolution uses sender authorization, checks access, and clears credential
   assert.equal(info.resolver, 'sender');
   assert.equal(info.itag, 141);
   assert.equal(info.duration, 100);
+  assert.equal(info.audio_duration, 99.95);
+  assert.equal(info.content_length, 1234567);
   assert.equal(request.params, 'context-params');
   assert.equal(request.playbackContext.contentPlaybackContext.signatureTimestamp, 123);
   assert.equal(context.user, undefined);

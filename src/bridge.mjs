@@ -65,7 +65,10 @@ class Worker extends EventEmitter {
             ['video_id', 'title', 'reason', 'error_type', 'resolver', 'itag', 'bitrate',
               'request_id', 'method', 'duration_ms', 'generation', 'kind', 'position',
               'read_ms', 'feed_ms', 'forced_kill', 'init_ms', 'player_ms',
-              'decipher_ms', 'access_ms', 'total_ms', 'cache_hit'].includes(key))
+              'decipher_ms', 'access_ms', 'total_ms', 'cache_hit', 'duration',
+              'returncode', 'partial_bytes', 'current_generation', 'current_decoder',
+              'audio_duration', 'content_length', 'bytes_read', 'input_seeks',
+              'container_duration'].includes(key))
         ));
         if (message.event === 'READY') {
           this.state = message.state;
@@ -80,7 +83,12 @@ class Worker extends EventEmitter {
   call(method, args = {}) {
     const id = ++this.sequence;
     const started = performance.now();
-    log('COMMAND_STARTED', { request_id: id, method });
+    log('COMMAND_STARTED', {
+      request_id: id, method,
+      video_id: method === 'play' ? args.video_id : undefined,
+      requested_position: ['play', 'seek'].includes(method) ? args.position : undefined,
+      position: this.state.position, duration: this.state.duration
+    });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -146,6 +154,10 @@ try {
   }, dialUuid);
   worker.on('event', message => {
     if (message.event === 'TRACK_ENDED') {
+      log('QUEUE_ADVANCE', {
+        reason: 'decoder_eof', video_id: message.video_id,
+        position: worker.state.position, duration: worker.state.duration
+      });
       // One queue authority: the YouTube receiver selects the next item.
       void player.next().catch(() => log('QUEUE_ADVANCE_FAILED'));
     } else if (message.event === 'TAKEN_OVER') {

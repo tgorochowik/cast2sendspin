@@ -28,6 +28,17 @@ from sender_resolver import SenderResolver
 
 FRAME_BYTES = 4800  # 25 ms, 48 kHz, stereo s16le
 SILENCE = bytes(FRAME_BYTES)
+# Resume interrupted seekable HTTP input at its encoded-byte offset, before
+# demuxer EOF. Do not reconnect_at_eof or reconnect_streamed: a real EOF must
+# finish, and a non-seekable stream must not be replayed from the beginning.
+FFMPEG_HTTP_OPTIONS = (
+    "-reconnect", "1",
+    "-reconnect_on_network_error", "1",
+    "-reconnect_delay_max", "2",
+    "-reconnect_max_retries", "3",
+    "-reconnect_delay_total_max", "5",
+    "-rw_timeout", "10000000",
+)
 
 
 def apply_input_volume(pcm, volume):
@@ -101,6 +112,7 @@ class Worker:
         self.resolution_task = None
         self.resolver = SenderResolver(lambda **fields: emit("RESOLVER_TIMING", **fields))
         self.resolver_warmup_task = None
+        self.decoder_diagnostics = set()
 
     def invalidate(self):
         self.generation += 1
@@ -263,9 +275,19 @@ class Worker:
                         kind = "audio"
                     except asyncio.IncompleteReadError as e:
                         code = await decoder.wait()
+                        emit("DECODER_EOF", video_id=self.video_id,
+                             position=round(self.position, 3), duration=self.duration,
+                             returncode=code, partial_bytes=len(e.partial),
+                             generation=generation, current_generation=self.generation,
+                             current_decoder=decoder is self.decoder)
                         if decoder is self.decoder:
                             self.decoder = None
-                            if code == 0:
+                            expected = (self.info or {}).get("audio_duration") or self.duration
+                            if math.isfinite(expected) and expected > self.position + 2:
+                                emit("PLAYBACK_ERROR", reason="Audio stream ended before track completion",
+                                     video_id=self.video_id, position=round(self.position, 3),
+                                     duration=expected)
+                            elif code == 0:
                                 emit("TRACK_ENDED", video_id=self.video_id)
                             else:
                                 emit("PLAYBACK_ERROR", reason="Decoder failed")
@@ -330,17 +352,52 @@ class Worker:
         url = self.info.get("url")
         if not url or not url.startswith("https://"):
             raise RuntimeError("Extractor did not return an HTTPS audio stream")
-        # No shell, no stderr dump: signed URLs must not enter logs.
+        # No shell or raw stderr dump: signed URLs must not enter logs.
         self.decoder = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "verbose",
+            *FFMPEG_HTTP_OPTIONS,
             "-user_agent", (self.info.get("http_headers") or {}).get("User-Agent", "cast2sendspin"),
             "-ss", str(position), "-i", url, "-vn",
             "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        diagnostic = asyncio.create_task(self.read_decoder_diagnostics(self.decoder, self.generation))
+        self.decoder_diagnostics.add(diagnostic)
+        diagnostic.add_done_callback(self.decoder_diagnostics.discard)
         self.position = position
         emit("DECODER_STARTED", position=position, generation=self.generation,
              duration_ms=round((asyncio.get_running_loop().time() - started) * 1000))
+
+    async def read_decoder_diagnostics(self, decoder, generation):
+        """Drain stderr using bounded memory; expose only fixed reason codes."""
+        patterns = {
+            b"stream ends prematurely": "http_truncated",
+            b"file ended prematurely": "container_truncated",
+            b"connection reset": "connection_reset",
+            b"http error": "http_error",
+            b"input/output error": "io_error",
+            b"invalid data": "invalid_data",
+            b"packet corrupt": "corrupt_packet",
+            b"connection timed out": "connection_timeout",
+            b"will reconnect at": "http_reconnect",
+        }
+        seen, suffix, stats = set(), b"", {}
+        while chunk := await decoder.stderr.read(4096):
+            data = suffix + chunk.lower()
+            for pattern, reason in patterns.items():
+                if pattern in data and reason not in seen:
+                    seen.add(reason)
+                    emit("DECODER_DIAGNOSTIC", reason=reason, generation=generation)
+            match = re.search(rb"statistics: (\d+) bytes read, (\d+) seeks\s*\n", data)
+            if match:
+                stats.update(bytes_read=int(match[1]), input_seeks=int(match[2]))
+            match = re.search(rb"duration: (\d+):(\d+):(\d+\.\d+),", data)
+            if match:
+                stats["container_duration"] = (
+                    int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
+                )
+            suffix = data[-256:]
+        emit("DECODER_INPUT_STATS", generation=generation, **stats)
 
     async def play(self, video_id, position=0, context=None):
         if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
@@ -370,7 +427,9 @@ class Worker:
                 raise RuntimeError("Playback request superseded")
             self.info, self.video_id = info, video_id
             emit("AUDIO_RESOLVED", video_id=video_id, resolver=info.get("resolver"),
-                 itag=info.get("itag"), bitrate=info.get("bitrate"))
+                 itag=info.get("itag"), bitrate=info.get("bitrate"),
+                 duration=info.get("duration"), audio_duration=info.get("audio_duration"),
+                 content_length=info.get("content_length"))
             self.duration = float(info.get("duration") or 0)
             self.paused = True
             try:
@@ -537,6 +596,8 @@ class Worker:
                 self.capture_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.capture_task
+            if self.decoder_diagnostics:
+                await asyncio.gather(*self.decoder_diagnostics)
             if self.client:
                 await self.client.disconnect()
             await self.ma.client.disconnect()
