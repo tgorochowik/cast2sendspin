@@ -9,6 +9,9 @@ import {
   addRoute, cleanName, initialRegistry, validateRegistry, ensureManualRoute,
   setRoutingMode, desiredRoutes
 } from './registry.mjs';
+import {
+  playbackSettings, setPlaybackSettings, configFingerprint, requestPlaybackSettings
+} from './playback-settings.mjs';
 
 process.umask(0o077);
 const exec = promisify(execFile);
@@ -42,6 +45,8 @@ try {
   registry = initialRegistry(config, uuid);
 }
 validateRegistry(registry);
+// Seed existing installations once; later UI choices override the config default.
+registry.playback = playbackSettings(registry, config);
 async function save() {
   validateRegistry(registry);
   await writeFile(`${registryPath}.tmp`, JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
@@ -73,6 +78,7 @@ function effectiveConfig(route) {
   const p = players.find(p => p.player_id === route.player_id);
   return {
     ...config, routing_mode: manual ? 'manual' : 'automatic',
+    ...playbackSettings(registry, config),
     target_player_id: manual ? null : route.player_id,
     target_player_name: manual ? 'Manual routing in Music Assistant' : (p?.name || route.name),
     receiver_name: route.name,
@@ -80,6 +86,18 @@ function effectiveConfig(route) {
     source_name: manual ? route.name : (
       route.id === 'legacy' ? 'YouTube Music Cast Input' : `YouTube Cast · ${route.name}`)
   };
+}
+
+async function pushPlaybackSettings(id, entry) {
+  const settings = playbackSettings(registry, config);
+  if (entry.status !== 'running' || entry.appliedStop === settings.stop_receiver_on_seek) return;
+  try {
+    await requestPlaybackSettings(entry.child, settings);
+    entry.appliedStop = settings.stop_receiver_on_seek;
+    await log('PLAYBACK_SETTINGS_APPLIED', { id, ...settings });
+  } catch {
+    await log('PLAYBACK_SETTINGS_PENDING', { id });
+  }
 }
 
 async function stopChild(id) {
@@ -104,7 +122,7 @@ async function stopChild(id) {
 
 async function startChild(route) {
   const childConfig = effectiveConfig(route);
-  const fingerprint = JSON.stringify(childConfig);
+  const fingerprint = configFingerprint(childConfig);
   const path = `.state/routes/${route.id}/config.json`;
   await mkdir(`.state/routes/${route.id}`, { recursive: true, mode: 0o700 });
   await writeFile(path, JSON.stringify(childConfig, null, 2), { mode: 0o600 });
@@ -118,7 +136,10 @@ async function startChild(route) {
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'], detached: true
   });
-  const entry = { child, status: 'starting', fingerprint, stopping: false };
+  const entry = {
+    child, status: 'starting', fingerprint, stopping: false,
+    appliedStop: childConfig.stop_receiver_on_seek
+  };
   children.set(route.id, entry);
   child.stderr.on('data', () => {}); // Never forward raw upstream output.
   child.on('error', () => { entry.status = 'error'; });
@@ -129,6 +150,7 @@ async function startChild(route) {
       entry.status = 'running';
       retryAfter.delete(route.id);
       void log('RECEIVER_READY', { id: route.id, name: route.name, port: route.port });
+      void enqueue(() => pushPlaybackSettings(route.id, entry));
     } else if (data.event === 'STARTUP_FAILED' || data.event === 'FATAL') {
       entry.status = 'error';
     }
@@ -151,11 +173,13 @@ async function reconcile() {
   for (const route of wanted) {
     if (stopping) return;
     const entry = children.get(route.id);
-    if (entry && entry.fingerprint !== JSON.stringify(effectiveConfig(route))) {
+    if (entry && entry.fingerprint !== configFingerprint(effectiveConfig(route))) {
       await stopChild(route.id);
     }
     if (!children.has(route.id) && Date.now() >= (retryAfter.get(route.id) || 0)) {
       await startChild(route);
+    } else if (children.has(route.id)) {
+      await pushPlaybackSettings(route.id, children.get(route.id));
     }
   }
 }
@@ -202,6 +226,11 @@ function state() {
     updatedAt, discoveryError, players: manual ? [] : players,
     routes: manual ? [] : registry.routes.map(summary),
     manual: registry.manual ? summary(registry.manual) : null,
+    playback: {
+      ...playbackSettings(registry, config),
+      pending: [...children.values()].some(entry =>
+        entry.appliedStop !== playbackSettings(registry, config).stop_receiver_on_seek)
+    },
   };
 }
 
@@ -242,6 +271,16 @@ const server = createServer(async (request, response) => {
       if (body.length > 8192) return json(response, 413, { error: 'Request too large' });
     }
     const input = JSON.parse(body || '{}');
+    if (path === '/api/playback') {
+      await enqueue(async () => {
+        const previous = registry.playback;
+        setPlaybackSettings(registry, input);
+        try { await save(); }
+        catch (error) { registry.playback = previous; throw error; }
+        await Promise.all([...children].map(([id, entry]) => pushPlaybackSettings(id, entry)));
+      });
+      return json(response, 200, state());
+    }
     if (path === '/api/refresh') {
       await enqueue(refresh);
       return json(response, 200, state());
@@ -299,6 +338,7 @@ const server = createServer(async (request, response) => {
       'Use a receiver name of 1–80 characters without control characters',
       'Another enabled receiver already uses that name', 'This player already has a receiver',
       'Invalid routing mode', 'Enabled state is required',
+      'Seek stop setting must be boolean',
       'Switch to per-speaker mode to edit speaker receivers'
     ]);
     json(response, 400, { error: safe.has(error.message) ? error.message : 'Request failed; check discovery and receiver status' });

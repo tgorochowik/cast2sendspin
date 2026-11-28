@@ -40,6 +40,11 @@ export function cleanName(name) {
 export function validateRegistry(registry) {
   if (registry.version !== 1 || !Array.isArray(registry.routes)) throw new Error('Invalid receiver registry');
   if (!['automatic', 'manual'].includes(registry.mode || 'automatic')) throw new Error('Invalid routing mode');
+  if (registry.playback !== undefined
+      && (registry.playback === null
+          || typeof registry.playback.stop_receiver_on_seek !== 'boolean')) {
+    throw new Error('Seek stop setting must be boolean');
+  }
   if (registry.manual && registry.manual.player_id !== '__manual_source__') throw new Error('Invalid manual source');
   const ids = new Set(), ports = new Set(), players = new Set(), uuids = new Set();
   for (const r of [...registry.routes, ...(registry.manual ? [registry.manual] : [])]) {

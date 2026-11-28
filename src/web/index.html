@@ -30,6 +30,26 @@
         <button type="button" data-mode="manual" aria-pressed="false" disabled>Single source</button>
       </div>
     </section>
+    <section class="playback-section" aria-labelledby="playback-title">
+      <div>
+        <h2 id="playback-title">Seeking</h2>
+        <p id="seek-description">Keeping the output running delivers new-position audio much faster,
+          but may feel more sluggish because old audio continues to play from MA and speaker buffers.
+          Turn this on to interrupt old audio before seeking. Pause still stops output promptly.</p>
+        <p class="hint">The current song is fetched ahead automatically while playback starts
+          (32 MiB cache limit per receiver).
+          This switch applies to per-speaker receivers; single-source mode leaves MA outputs alone.</p>
+        <p id="playback-status" class="hint" role="status"></p>
+      </div>
+      <form id="playback-form">
+        <label class="switch-label" for="stop-receiver-on-seek">
+          <input id="stop-receiver-on-seek" class="switch" type="checkbox"
+                 role="switch" name="stop_receiver_on_seek" aria-describedby="seek-description" disabled>
+          Stop Sendspin output while seeking
+        </label>
+        <button class="button secondary" type="submit" disabled>Save</button>
+      </form>
+    </section>
     <p id="error" class="error" role="alert" hidden></p>
     <p id="status" class="status-line" role="status">Connecting…</p>
 

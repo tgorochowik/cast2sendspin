@@ -57,18 +57,43 @@ For manual routing, select **Single source** in the UI, then play its input from
 
 In per-speaker mode, pause stops MA's output while keeping the YouTube session;
 MA may show the speaker as idle. Resume restarts the input at the remembered
-position, and seek interrupts the output before restarting at the new position.
-Restarting can still take time to buffer. Single-source/manual mode leaves MA's
-output controls alone.
+position. The seeking preference below determines whether seeking interrupts the
+output or keeps it running. Restarting can still take time to buffer.
+Single-source/manual mode leaves MA's output controls alone.
 
 Each enabled receiver keeps a YouTube resolver warm to reduce new-track startup
 time. Initialization is reused, but sender credentials are cleared after each
 request; every track still uses the current sender's authorization.
 
-Playback streams as audio arrives; the app does not download whole songs or
-speculatively buffer the next queue item. See the
-[latency investigation notes](docs/playback-latency-notes.md) for measurements and
-the results of the removed lookahead experiment.
+The selected track is fetched ahead automatically into a session-local
+encoded-audio memory cache, without re-encoding or additional quality loss.
+Playback starts after one small chunk, not the full download; seeks prioritize
+missing ranges. The limit is 32 MiB per receiver. Unknown-size, oversized, or
+unsupported range responses fall back to direct streaming during initialization.
+Nothing is saved to disk, shared between sessions, or fetched for the next track.
+
+### Seeking preference
+
+The web UI's **Stop Sendspin output while seeking** switch chooses the tradeoff:
+
+- **Off:** deliver new-position audio much faster without stopping MA output,
+  but seeking can feel more sluggish because old audio remains queued in MA or
+  speaker buffers.
+- **On:** stop the output before seeking, interrupting old audio, then restart
+  it at the new position.
+
+Pause and Stop keep their existing behavior. The switch applies to per-speaker
+routing only and takes effect on the **next seek without restarting casting**.
+UI choices persist in `.state/receivers.json`, including with Docker's read-only
+`config.json` mount. Set `"stop_receiver_on_seek": false` (or `true`) in
+`config.json` to seed the initial preference; an existing saved UI choice takes
+precedence. Older configurations retain their original stop-on-seek behavior
+unless a preference was set.
+
+See the [seek evaluation](docs/seek-buffer-evaluation.md) for the measured
+first-PCM timings and listening observations, and the
+[latency notes](docs/playback-latency-notes.md) for the removed next-track lookahead
+experiment. Faster PCM delivery is not a promise of an instant audible seek.
 
 ## Docker (optional)
 

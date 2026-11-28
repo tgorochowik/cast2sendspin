@@ -80,6 +80,14 @@ function row(player, route) {
 }
 function render() {
   const manual = snapshot.mode === 'manual';
+  const playbackForm = $('#playback-form');
+  const stopOnSeek = playbackForm.elements.namedItem('stop_receiver_on_seek');
+  stopOnSeek.checked = snapshot.playback.stop_receiver_on_seek;
+  stopOnSeek.disabled = false;
+  playbackForm.querySelector('button').disabled = false;
+  $('#playback-status').textContent = snapshot.playback.pending
+    ? 'Saved; waiting for receivers to acknowledge the change.'
+    : 'Applies to the next seek without restarting active casting sessions.';
   $('#refresh').disabled = false;
   modeButtons.forEach(button => {
     button.disabled = false;
@@ -142,6 +150,14 @@ modeButtons.forEach(button => button.addEventListener('click', () => {
   void action('/api/mode', { mode: button.dataset.mode });
 }));
 $('#manual-form').addEventListener('input', () => { dirty = true; });
+$('#playback-form').addEventListener('input', () => { dirty = true; });
+$('#playback-form').addEventListener('submit', event => {
+  event.preventDefault();
+  if (busy) return;
+  void action('/api/playback', {
+    stop_receiver_on_seek: event.currentTarget.elements.namedItem('stop_receiver_on_seek').checked
+  });
+});
 $('#manual-form').addEventListener('submit', event => {
   event.preventDefault();
   if (busy) return;

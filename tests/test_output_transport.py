@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from routing import SessionRouter
 from worker import Worker
@@ -9,9 +9,9 @@ from test_routing import FakeMA, URI
 
 
 class OutputTransportTests(unittest.IsolatedAsyncioTestCase):
-    async def worker(self):
+    async def worker(self, **config):
         ma = FakeMA()
-        worker = Worker(ma, {"target_player_id": "speaker"})
+        worker = Worker(ma, {"target_player_id": "speaker", **config})
         worker.router = SessionRouter(ma, "speaker", URI)
         await worker.router.claim()
         worker.info = {"url": "https://example.test/audio"}
@@ -37,6 +37,106 @@ class OutputTransportTests(unittest.IsolatedAsyncioTestCase):
         ma.call = call
         ma.calls.clear()
         return worker, ma
+
+    async def test_continuous_seek_does_not_interrupt_capture_or_control_ma_output(self):
+        worker, ma = await self.worker(seek_without_output_stop=True)
+        worker.stop_capture = AsyncMock()
+        capture = worker.capture_task = Mock()
+        result = await worker.command("seek", {"position": 120})
+        self.assertEqual(ma.calls, [])
+        worker.decoder_at.assert_awaited_once_with(120)
+        worker.stop_capture.assert_not_awaited()
+        self.assertIs(worker.capture_task, capture)
+        self.assertTrue(worker.streaming.is_set())
+        self.assertFalse(worker.router.suspended)
+        self.assertTrue(result["active"])
+        self.assertFalse(result["paused"])
+        self.assertEqual(result["position"], 120)
+
+    async def test_continuous_mode_pause_and_paused_seek_still_use_existing_safe_behavior(self):
+        worker, ma = await self.worker(seek_without_output_stop=True)
+        await worker.command("pause", {})
+        self.assertEqual([c for c, _ in ma.calls], ["players/cmd/stop"])
+        ma.calls.clear()
+        await worker.command("seek", {"position": 120})
+        worker.decoder_at.assert_not_awaited()
+        self.assertEqual(ma.calls, [])
+        self.assertTrue(worker.paused)
+        await worker.command("resume", {})
+        self.assertEqual([c for c, _ in ma.calls], ["players/cmd/select_source"])
+        worker.decoder_at.assert_awaited_once_with(120)
+
+    async def test_continuous_seek_never_decodes_or_reclaims_after_takeover(self):
+        worker, ma = await self.worker(seek_without_output_stop=True)
+        ma.p.update(active_source="other://music", playback_state="playing")
+        with self.assertRaisesRegex(RuntimeError, "no longer owns"):
+            await worker.command("seek", {"position": 120})
+        self.assertEqual(ma.calls, [])
+        worker.decoder_at.assert_not_awaited()
+        self.assertFalse(worker.router.active)
+
+    async def test_continuous_seek_rechecks_ownership_after_decoder_start(self):
+        worker, ma = await self.worker(seek_without_output_stop=True)
+
+        async def decode(_):
+            ma.p.update(active_source="other://music", playback_state="playing")
+
+        worker.decoder_at.side_effect = decode
+        with self.assertRaisesRegex(RuntimeError, "no longer owns"):
+            await worker.command("seek", {"position": 120})
+        self.assertEqual(ma.calls, [])
+        self.assertFalse(worker.router.active)
+        self.assertTrue(ma.p["powered"])
+        worker.stop_decoder.assert_awaited_once()
+
+    async def test_continuous_seek_failure_releases_own_output_instead_of_silent_orphan(self):
+        worker, ma = await self.worker(seek_without_output_stop=True)
+        worker.decoder_at.side_effect = RuntimeError("Decoder could not start")
+        with self.assertRaisesRegex(RuntimeError, "could not start"):
+            await worker.command("seek", {"position": 120})
+        self.assertFalse(worker.router.active)
+        self.assertFalse(ma.p["powered"])
+        self.assertTrue(worker.paused)
+        self.assertIsNone(worker.seek_timing)
+
+    async def test_continuous_mode_is_strictly_opt_in_and_not_applied_to_manual_routing(self):
+        for value in (False, "true", 1):
+            worker, _ = await self.worker(seek_without_output_stop=value)
+            self.assertFalse(worker.continuous_seek)
+        worker = Worker(Mock(), {"routing_mode": "manual", "seek_without_output_stop": True})
+        self.assertFalse(worker.continuous_seek)
+
+    async def test_live_setting_applies_to_next_seek_without_interrupting_on_save(self):
+        worker, ma = await self.worker(stop_receiver_on_seek=False)
+        await worker.command("configure_seek", {"stop_receiver_on_seek": True})
+        self.assertEqual(ma.calls, [])
+        worker.stop_decoder.assert_not_awaited()
+        self.assertFalse(worker.continuous_seek)
+        self.assertTrue(worker.nonblocking_pcm)
+        await worker.command("seek", {"position": 120})
+        self.assertEqual([c for c, _ in ma.calls], ["players/cmd/stop", "players/cmd/select_source"])
+        ma.calls.clear()
+        await worker.command("configure_seek", {"stop_receiver_on_seek": False})
+        await worker.command("seek", {"position": 200})
+        self.assertEqual(ma.calls, [])
+        self.assertTrue(worker.continuous_seek)
+        self.assertEqual(worker.config["stop_receiver_on_seek"], False)
+
+    async def test_live_setting_is_not_blocked_by_slow_playback_command(self):
+        worker, ma = await self.worker(stop_receiver_on_seek=True)
+        async with worker.lock:
+            await asyncio.wait_for(worker.command("configure_seek", {"stop_receiver_on_seek": False}), 0.2)
+        self.assertTrue(worker.continuous_seek)
+        self.assertEqual(ma.calls, [])
+
+    async def test_canonical_seek_setting_overrides_legacy_and_rejects_invalid_live_values(self):
+        worker, ma = await self.worker(stop_receiver_on_seek=True, seek_without_output_stop=True)
+        self.assertFalse(worker.continuous_seek)
+        for value in ("false", None, 0):
+            with self.assertRaisesRegex(ValueError, "boolean"):
+                await worker.command("configure_seek", {"stop_receiver_on_seek": value})
+        self.assertFalse(worker.continuous_seek)
+        self.assertEqual(ma.calls, [])
 
     async def test_pause_stops_output_but_preserves_session_position_and_power(self):
         worker, ma = await self.worker()

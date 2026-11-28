@@ -21,10 +21,11 @@ from aiosendspin.models.player import SupportedAudioFormat
 from aiosendspin.models.types import AudioCodec
 
 from ma import MA
-from app_config import load_config
+from app_config import load_config, stop_receiver_on_seek
 from routing import ManualSession, SessionRouter, owns_source, validate_target
 from source_client import connect_source
 from sender_resolver import SenderResolver
+from media_buffer import MediaBuffer
 
 FRAME_BYTES = 4800  # 25 ms, 48 kHz, stereo s16le
 SILENCE = bytes(FRAME_BYTES)
@@ -90,6 +91,8 @@ class Worker:
     def __init__(self, ma, config):
         self.ma, self.config = ma, config
         self.manual = config.get("routing_mode") == "manual"
+        self.continuous_seek = not stop_receiver_on_seek(config) and not self.manual
+        self.nonblocking_pcm = self.continuous_seek
         self.decoder_pending = False
         self.client = None
         self.router = None
@@ -113,6 +116,9 @@ class Worker:
         self.resolver = SenderResolver(lambda **fields: emit("RESOLVER_TIMING", **fields))
         self.resolver_warmup_task = None
         self.decoder_diagnostics = set()
+        self.media_buffer = None
+        self.seek_timing = None
+        self.pcm_read_task = None
 
     def invalidate(self):
         self.generation += 1
@@ -145,6 +151,45 @@ class Worker:
             self.ma, self.config["target_player_id"], uri)
         self.monitor_task = asyncio.create_task(self.monitor())
         emit("READY", state=self.state())
+
+    async def prepare_track(self, video_id, context):
+        info = await self.resolve_media(video_id, context)
+        cache = None
+        try:
+            if info.get("resolver") != "sender":
+                raise ValueError("Only sender-authorized finite media is buffered")
+            delay = self.config.get("media_buffer_prefetch_delay_ms", 0)
+            if type(delay) is not int or not 0 <= delay <= 5000:
+                raise ValueError("Invalid buffer test delay")
+            cache = MediaBuffer(
+                info["url"], info.get("content_length"), emit,
+                user_agent=(info.get("http_headers") or {}).get("User-Agent", "cast2sendspin"),
+                prefetch_delay=delay / 1000,
+            )
+            async with asyncio.timeout(3):
+                await cache.start()
+        except BaseException as error:
+            if cache:
+                await cache.close()
+            cache = None
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            # Unknown size, ignored Range, expired URL, excessive size or
+            # startup timeout: retain the existing direct-streaming path.
+            emit("BUFFER_UNAVAILABLE", error_type=type(error).__name__)
+        return info, cache
+
+    async def stop_buffer(self):
+        cache, self.media_buffer = self.media_buffer, None
+        if cache:
+            await cache.close()
+
+    def buffer_snapshot(self):
+        return {
+            "seek_output_mode": "continuous" if self.continuous_seek else "interrupt",
+            **({"mode": "buffered", **self.media_buffer.snapshot()}
+               if self.media_buffer else {"mode": "direct"}),
+        }
 
     async def warmup_resolver(self):
         try:
@@ -211,6 +256,7 @@ class Worker:
                 self.router.yield_to_external()
                 self.invalidate()
                 await self.stop_decoder()
+                await self.stop_buffer()
                 emit("TAKEN_OVER")
 
     async def suspend_output(self):
@@ -234,6 +280,32 @@ class Worker:
             await self.stop_decoder()
             await self.router.finish()
             raise
+
+    async def seek_continuously(self, position):
+        """Replace decoder input, retaining the already-owned output stream."""
+        await self.router.require_ownership()
+        self.invalidate()
+        self.decoder_pending = False
+        try:
+            await self.decoder_at(position)
+            # Never keep feeding a destination taken over during replacement.
+            await self.router.require_ownership()
+            if not self.streaming.is_set():
+                raise RuntimeError("Source stream ended during seek")
+        except BaseException:
+            self.seek_timing = None
+            self.paused = True
+            await self.stop_decoder()
+            await self.stop_buffer()
+            await self.router.finish()
+            raise
+
+    async def read_pcm(self, decoder):
+        started = asyncio.get_running_loop().time()
+        async with asyncio.timeout(15):
+            async with self.decoder_read_lock:
+                pcm = await decoder.stdout.readexactly(FRAME_BYTES)
+        return pcm, round((asyncio.get_running_loop().time() - started) * 1000)
 
     async def stream(self):
         self.capture_failure = None
@@ -262,24 +334,37 @@ class Worker:
                 generation = self.generation
                 if decoder and not self.paused:
                     try:
-                        read_started = asyncio.get_running_loop().time()
-                        async with asyncio.timeout(15):
-                            async with self.decoder_read_lock:
-                                if decoder is not self.decoder:
-                                    continue
-                                pcm = await decoder.stdout.readexactly(FRAME_BYTES)
-                        read_ms = round((asyncio.get_running_loop().time() - read_started) * 1000)
-                        if generation != self.generation or decoder is not self.decoder:
-                            continue
-                        self.position += len(pcm) / 192000
-                        kind = "audio"
+                        ready = True
+                        if self.nonblocking_pcm:
+                            if self.pcm_read_task is None:
+                                self.pcm_read_task = asyncio.create_task(self.read_pcm(decoder))
+                            if self.pcm_read_task.done():
+                                task, self.pcm_read_task = self.pcm_read_task, None
+                                pcm, read_ms = task.result()
+                            else:
+                                # Do not stall capture while waiting for a new
+                                # decoder/network read; maintain its 25 ms clock.
+                                ready, kind = False, "buffering"
+                        else:
+                            pcm, read_ms = await self.read_pcm(decoder)
+                        if ready:
+                            if generation != self.generation or decoder is not self.decoder:
+                                continue
+                            self.position += len(pcm) / 192000
+                            kind = "audio"
+                            if self.nonblocking_pcm:
+                                # Read the next frame between capture ticks,
+                                # rather than accidentally running at half rate.
+                                self.pcm_read_task = asyncio.create_task(self.read_pcm(decoder))
                     except asyncio.IncompleteReadError as e:
                         code = await decoder.wait()
                         emit("DECODER_EOF", video_id=self.video_id,
                              position=round(self.position, 3), duration=self.duration,
                              returncode=code, partial_bytes=len(e.partial),
-                             generation=generation, current_generation=self.generation,
-                             current_decoder=decoder is self.decoder)
+                              generation=generation, current_generation=self.generation,
+                              current_decoder=decoder is self.decoder)
+                        if generation != self.generation or decoder is not self.decoder:
+                            continue
                         if decoder is self.decoder:
                             self.decoder = None
                             expected = (self.info or {}).get("audio_duration") or self.duration
@@ -295,6 +380,14 @@ class Worker:
                 feed_started = asyncio.get_running_loop().time()
                 await capture.feed(apply_input_volume(pcm, self.volume) if self.manual else pcm)
                 feed_ms = round((asyncio.get_running_loop().time() - feed_started) * 1000)
+                timing = self.seek_timing
+                if kind == "audio" and timing and timing.get("generation") == generation:
+                    emit("SEEK_AUDIO", generation=generation,
+                         requested_position=timing["position"], position=round(self.position, 3),
+                         duration_ms=round((asyncio.get_running_loop().time() - timing["started"]) * 1000),
+                         **{**self.buffer_snapshot(),
+                            "seek_output_mode": timing.get("output_mode", "interrupt")})
+                    self.seek_timing = None
                 pcm_state = (generation, kind)
                 if pcm_state != last_pcm_state:
                     emit("PCM_TRANSITION", generation=generation, kind=kind,
@@ -315,14 +408,23 @@ class Worker:
                 await capture.stop()
 
     async def stop_decoder(self):
+        started = asyncio.get_running_loop().time()
         proc, self.decoder = self.decoder, None
+        task, self.pcm_read_task = self.pcm_read_task, None
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         if not proc:
             return
-        started = asyncio.get_running_loop().time()
         forced_kill = False
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
+        if self.media_buffer:
+            # Wake a decoder blocked on an uncached local HTTP range. Keep the
+            # cached bytes/background fill, but do not wait for network timeout
+            # before it can observe SIGTERM during a rapid seek.
+            await self.media_buffer.disconnect_readers()
 
         async def drain_and_wait():
             # FFmpeg may flush PCM on SIGTERM. Without a reader its full pipe
@@ -352,10 +454,14 @@ class Worker:
         url = self.info.get("url")
         if not url or not url.startswith("https://"):
             raise RuntimeError("Extractor did not return an HTTPS audio stream")
+        if self.media_buffer:
+            url = self.media_buffer.url
+        input_options = (("-rw_timeout", "10000000") if self.media_buffer
+                         else FFMPEG_HTTP_OPTIONS)
         # No shell or raw stderr dump: signed URLs must not enter logs.
         self.decoder = await asyncio.create_subprocess_exec(
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "verbose",
-            *FFMPEG_HTTP_OPTIONS,
+            *input_options,
             "-user_agent", (self.info.get("http_headers") or {}).get("User-Agent", "cast2sendspin"),
             "-ss", str(position), "-i", url, "-vn",
             "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
@@ -365,6 +471,10 @@ class Worker:
         self.decoder_diagnostics.add(diagnostic)
         diagnostic.add_done_callback(self.decoder_diagnostics.discard)
         self.position = position
+        if self.nonblocking_pcm:
+            self.pcm_read_task = asyncio.create_task(self.read_pcm(self.decoder))
+        if self.seek_timing:
+            self.seek_timing["generation"] = self.generation
         emit("DECODER_STARTED", position=position, generation=self.generation,
              duration_ms=round((asyncio.get_running_loop().time() - started) * 1000))
 
@@ -409,28 +519,46 @@ class Worker:
             generation = self.generation
             self.decoder_pending = False
             self.info = None
+            self.seek_timing = None
             await self.stop_decoder()
+            await self.stop_buffer()
         # Resolve outside the state lock: Stop Casting can cancel ownership
         # immediately even if an upstream extractor is slow.
-        task = asyncio.create_task(self.resolve_media(video_id, context))
+        task = asyncio.create_task(self.prepare_track(video_id, context))
         self.resolution_task = task
         try:
             async with asyncio.timeout(65):
-                info = await task
+                info, cache = await task
         except asyncio.CancelledError:
+            # Cancellation can race a completed preparation whose result has
+            # not yet been adopted by this playback generation.
+            if task.done() and not task.cancelled():
+                with contextlib.suppress(Exception):
+                    _, unused = task.result()
+                    if unused:
+                        await unused.close()
             raise RuntimeError("Playback request superseded") from None
         finally:
             if self.resolution_task is task:
                 self.resolution_task = None
-        async with self.lock:
+        try:
+            await self.lock.acquire()
+        except BaseException:
+            if cache:
+                await cache.close()
+            raise
+        try:
             if generation != self.generation:
+                if cache:
+                    await cache.close()
                 raise RuntimeError("Playback request superseded")
-            self.info, self.video_id = info, video_id
+            self.info, self.video_id, self.media_buffer = info, video_id, cache
             emit("AUDIO_RESOLVED", video_id=video_id, resolver=info.get("resolver"),
                  itag=info.get("itag"), bitrate=info.get("bitrate"),
                  duration=info.get("duration"), audio_duration=info.get("audio_duration"),
                  content_length=info.get("content_length"))
             self.duration = float(info.get("duration") or 0)
+            emit("MEDIA_MODE", video_id=video_id, **self.buffer_snapshot())
             self.paused = True
             try:
                 if not self.router.active:
@@ -458,10 +586,13 @@ class Worker:
                         await asyncio.sleep(0.05)
             except BaseException:
                 await self.stop_decoder()
+                await self.stop_buffer()
                 await self.router.finish()
                 raise
             emit("PLAYING", video_id=video_id, title=info.get("title"))
             return self.state()
+        finally:
+            self.lock.release()
 
     def state(self):
         return {"position": self.position, "duration": self.duration,
@@ -469,6 +600,18 @@ class Worker:
                 "active": bool(self.router and self.router.active)}
 
     async def command(self, method, args):
+        if method == "configure_seek":
+            value = args.get("stop_receiver_on_seek")
+            if type(value) is not bool:
+                raise ValueError("Seek stop setting must be boolean")
+            self.config["stop_receiver_on_seek"] = value
+            self.continuous_seek = not value and not self.manual
+            # Once enabled, retain the nonblocking read pump until shutdown.
+            # A policy toggle must not cancel a live frame read, restart the
+            # capture, or change an in-flight seek's already-selected strategy.
+            self.nonblocking_pcm = self.nonblocking_pcm or self.continuous_seek
+            emit("PLAYBACK_SETTINGS_APPLIED", stop_receiver_on_seek=value)
+            return self.state()
         if method == "play":
             return await self.play(args["video_id"], float(args.get("position", 0)), args.get("context"))
         async with self.lock:
@@ -476,7 +619,9 @@ class Worker:
                 return self.state()
             if method == "finish":
                 self.invalidate()
+                self.seek_timing = None
                 await self.stop_decoder()
+                await self.stop_buffer()
                 if self.router:
                     await self.router.finish()
                 self.info = None
@@ -484,9 +629,12 @@ class Worker:
                 self.position = self.duration = 0
             elif method == "track_stop":
                 self.invalidate()
+                self.seek_timing = None
                 await self.stop_decoder()
+                await self.stop_buffer()
                 self.decoder_pending = False
             elif method == "pause":
+                self.seek_timing = None
                 if self.manual:
                     self.paused = True
                 else:
@@ -504,7 +652,19 @@ class Worker:
                     raise RuntimeError("Invalid seek position")
                 if not self.router.active:
                     raise RuntimeError("Cast no longer owns this destination")
-                if not self.manual:
+                continuous = (self.continuous_seek and not self.paused
+                              and not self.router.suspended and self.streaming.is_set())
+                emit("SEEK_STARTED", requested_position=position, position=round(self.position, 3),
+                     **{**self.buffer_snapshot(),
+                        "seek_output_mode": "continuous" if continuous else "interrupt"})
+                self.seek_timing = (
+                    {"started": asyncio.get_running_loop().time(), "position": position,
+                     "output_mode": "continuous" if continuous else "interrupt"}
+                    if not self.paused and self.streaming.is_set() else None
+                )
+                if continuous:
+                    await self.seek_continuously(position)
+                elif not self.manual:
                     was_paused = self.paused
                     await self.suspend_output()
                     self.position = position
@@ -558,6 +718,7 @@ class Worker:
                             self.router.yield_to_external()
                             self.invalidate()
                             await self.stop_decoder()
+                            await self.stop_buffer()
                             emit("TAKEN_OVER")
             except asyncio.CancelledError:
                 raise
@@ -569,12 +730,14 @@ class Worker:
                         self.router.yield_to_external()
                         self.invalidate()
                         await self.stop_decoder()
+                        await self.stop_buffer()
                     emit("PLAYBACK_ERROR", reason="MA connection lost")
 
     async def command_manual_disconnect(self):
         self.invalidate()
         self.decoder_pending = False
         await self.stop_decoder()
+        await self.stop_buffer()
         await self.router.finish()
         emit("PLAYBACK_ERROR", reason="Sendspin source disconnected")
 
@@ -587,6 +750,7 @@ class Worker:
         try:
             await self.command("finish", {})
         finally:
+            await self.stop_buffer()
             if self.resolver_warmup_task:
                 self.resolver_warmup_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

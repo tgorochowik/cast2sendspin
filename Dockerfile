@@ -46,6 +46,7 @@ CMD ["node", "src/manager.mjs"]
 FROM runtime AS test
 COPY Dockerfile .dockerignore .gitignore package-lock.json requirements.txt ./
 COPY tests/ ./tests/
+COPY scripts/ ./scripts/
 RUN node --test tests/*.test.mjs \
     && .venv/bin/python -m unittest discover -s tests
 

@@ -4,5 +4,6 @@
   "dial_interface": "eth0",
   "management_host": "127.0.0.1",
   "management_port": 8790,
-  "allow_anonymous_fallback": false
+  "allow_anonymous_fallback": false,
+  "stop_receiver_on_seek": false
 }

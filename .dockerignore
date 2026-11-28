@@ -20,3 +20,5 @@
 !tests/
 !tests/*.test.mjs
 !tests/test_*.py
+!scripts/
+!scripts/seek_report.py

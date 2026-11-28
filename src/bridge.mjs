@@ -7,6 +7,7 @@ import { BridgePlayer } from './bridge-player.mjs';
 import { LocalStore, log, logger } from './runtime.mjs';
 import { randomUUID } from 'node:crypto';
 import { createReceiver } from './receiver.mjs';
+import { bindPlaybackSettings } from './playback-settings.mjs';
 
 process.umask(0o077);
 const config = JSON.parse(await readFile(process.env.BRIDGE_CONFIG || 'config.json', 'utf8'));
@@ -68,7 +69,9 @@ class Worker extends EventEmitter {
               'decipher_ms', 'access_ms', 'total_ms', 'cache_hit', 'duration',
               'returncode', 'partial_bytes', 'current_generation', 'current_decoder',
               'audio_duration', 'content_length', 'bytes_read', 'input_seeks',
-              'container_duration'].includes(key))
+              'container_duration', 'mode', 'requested_position', 'buffered_bytes',
+              'total_bytes', 'buffer_complete', 'byte_offset', 'attempt',
+               'prefetch_delay_ms', 'seek_output_mode', 'stop_receiver_on_seek'].includes(key))
         ));
         if (message.event === 'READY') {
           this.state = message.state;
@@ -102,6 +105,7 @@ class Worker extends EventEmitter {
 }
 
 const worker = new Worker();
+bindPlaybackSettings(process, worker);
 let receiver;
 let stopping = false;
 async function stop() {

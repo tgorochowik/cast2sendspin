@@ -7,6 +7,42 @@ from worker import FRAME_BYTES, Worker, handle_command
 
 
 class LatencyDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_seek_audio_timing_is_emitted_only_after_new_generation_pcm_is_fed(self):
+        for mode in ("direct", "buffered"):
+            with self.subTest(mode=mode):
+                worker = Worker(Mock(), {})
+                worker.position = 100
+                worker.seek_timing = {
+                    "started": asyncio.get_running_loop().time(),
+                    "position": 100, "generation": worker.generation,
+                }
+                worker.decoder = Mock(stdout=Mock(
+                    readexactly=AsyncMock(return_value=bytes(FRAME_BYTES)),
+                ))
+                if mode == "buffered":
+                    worker.media_buffer = Mock(snapshot=Mock(return_value={
+                        "buffered_bytes": 1000, "total_bytes": 1000,
+                        "buffer_complete": True, "prefetch_delay_ms": 0,
+                    }))
+                fed = asyncio.Event()
+                capture = Mock(start=AsyncMock(), feed=AsyncMock(side_effect=lambda _: fed.set()),
+                               stop=AsyncMock())
+                worker.client = Mock(create_source_capture=Mock(return_value=capture))
+                with patch("worker.emit") as emit:
+                    task = asyncio.create_task(worker.stream())
+                    try:
+                        await asyncio.wait_for(fed.wait(), 1)
+                    finally:
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+                timings = [call.kwargs for call in emit.call_args_list if call.args == ("SEEK_AUDIO",)]
+                self.assertEqual(len(timings), 1)
+                self.assertEqual(timings[0]["requested_position"], 100)
+                self.assertEqual(timings[0]["mode"], mode)
+                self.assertGreaterEqual(timings[0]["duration_ms"], 0)
+                self.assertIsNone(worker.seek_timing)
+
     async def test_clean_exit_with_missing_audio_is_error_not_queue_advance(self):
         worker = Worker(Mock(), {})
         worker.position, worker.duration = 203.65, 216
