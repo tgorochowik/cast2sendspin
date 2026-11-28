@@ -10,6 +10,15 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 
+test('seeking settings follow both routing sections and the header has no local badge', async () => {
+  const html = await readFile(new URL('../src/web/index.html', import.meta.url), 'utf8');
+  const seeking = html.indexOf('<section class="playback-section"');
+  const manualEnd = html.indexOf('</section>', html.indexOf('id="manual-section"'));
+  assert.ok(seeking > manualEnd);
+  assert.ok(seeking < html.indexOf('<footer>'));
+  assert.doesNotMatch(html, /local-badge/);
+});
+
 test('management preference API is CSRF-protected, strict, persistent and does not write config', {
   timeout: 15000
 }, async () => {
